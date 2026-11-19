@@ -1,5 +1,6 @@
 import os
 import asyncio
+import aiohttp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
@@ -7,10 +8,23 @@ from aiohttp import web
 
 TOKEN = os.getenv("BOT_TOKEN")
 
+# Твой личный ID (бот будет слать уведомления о скидках сюда):
+ADMIN_ID = 6249438349
+
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Кнопки внизу экрана
+# Список артикулов WB, за ценами которых следит бот (можно добавлять свои через запятую):
+WATCH_LIST = [
+    211689745,  # Наушники
+    173259832,  # Смарт-часы
+    146975958,  # Пауэрбанк
+]
+
+# Память цен
+last_prices = {}
+
+# Главное меню
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🚀 Старт"), KeyboardButton(text="🔵 Скидки OZON")],
@@ -19,16 +33,16 @@ main_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# Команда /start и кнопка "🚀 Старт"
+# Команда /start
 @dp.message(Command("start"))
 @dp.message(F.text == "🚀 Старт")
 async def start_handler(message: types.Message):
     text = (
         "👋 <b>Добро пожаловать в бота со скидками и халявой!</b>\n\n"
         "Выбирай нужный раздел кнопками ниже:\n"
-        "• <b>«🔵 Скидки OZON»</b> — секретные артикулы товаров по низким ценам\n"
-        "• <b>«🎁 Халява»</b> — промокоды на доставку еды и продуктов\n"
-        "• <b>«📢 Наш канал»</b> — переход в наш канал со скидками"
+        "• <b>«🔵 Скидки OZON»</b> — секретные артикулы товаров по акции\n"
+        "• <b>«🎁 Халява»</b> — промокоды на доставку «Пятёрочка»\n"
+        "• <b>«📢 Наш канал»</b> — подписка на канал @productdiscounts2"
     )
     await message.answer(text, reply_markup=main_keyboard, parse_mode="HTML")
 
@@ -52,12 +66,7 @@ async def ozon_items_handler(message: types.Message):
         [InlineKeyboardButton(text="💨 Воздуходувка за 1300 ₽", url="https://www.ozon.ru/product/6230129353")]
     ])
     
-    await message.answer(
-        text,
-        reply_markup=ozon_inline_kb,
-        parse_mode="HTML",
-        disable_web_page_preview=True
-    )
+    await message.answer(text, reply_markup=ozon_inline_kb, parse_mode="HTML", disable_web_page_preview=True)
 
 # Раздел "Халява" (Пятёрочка)
 @dp.message(F.text == "🎁 Халява")
@@ -77,12 +86,7 @@ async def halyava_handler(message: types.Message):
         [InlineKeyboardButton(text="📦 Скидка 400 ₽ (Пятёрочка)", url="https://5dostavka.ru")]
     ])
     
-    await message.answer(
-        text,
-        reply_markup=pyaterochka_kb,
-        parse_mode="HTML",
-        disable_web_page_preview=True
-    )
+    await message.answer(text, reply_markup=pyaterochka_kb, parse_mode="HTML", disable_web_page_preview=True)
 
 # Раздел "Наш канал"
 @dp.message(F.text == "📢 Наш канал")
@@ -98,7 +102,57 @@ async def channel_handler(message: types.Message):
         parse_mode="HTML"
     )
 
-# Фоновый веб-сервер для бесплатного тарифа Render
+# Функция проверки цен на Wildberries
+async def check_wb_price(article: int):
+    url = f"https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={article}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    products = data.get("data", {}).get("products", [])
+                    if products:
+                        prod = products[0]
+                        name = prod.get("name", "Товар со скидкой")
+                        price = prod.get("sizes", [{}])[0].get("price", {}).get("total", 0) // 100
+                        return name, price
+    except Exception as e:
+        print(f"Ошибка проверки WB {article}: {e}")
+    return None, None
+
+# Фоновый цикл проверки цен (каждые 30 минут)
+async def price_tracker_loop():
+    await asyncio.sleep(15)
+    while True:
+        for article in WATCH_LIST:
+            name, current_price = await check_wb_price(article)
+            if current_price and current_price > 0:
+                old_price = last_prices.get(article)
+                
+                # Если цена стала ниже, чем была:
+                if old_price and current_price < old_price:
+                    sale_percent = int(((old_price - current_price) / old_price) * 100)
+                    msg_text = (
+                        "🚨 <b>ЦЕНА УПАЛА! ГОТОВЫЙ ПОСТ ДЛЯ КАНАЛА:</b> 🚨\n\n"
+                        f"🔥 <b>{name}</b>\n"
+                        f"📉 Скидка: <b>-{sale_percent}%</b>\n"
+                        f"💰 Было: <s>{old_price} ₽</s> ➡️ <b>{current_price} ₽</b>\n"
+                        f"📦 Артикул WB: <code>{article}</code>\n\n"
+                        f"👉 https://www.wildberries.ru/catalog/{article}/detail.aspx"
+                    )
+                    try:
+                        await bot.send_message(chat_id=ADMIN_ID, text=msg_text, parse_mode="HTML")
+                    except Exception as err:
+                        print(f"Ошибка отправки админу: {err}")
+                
+                last_prices[article] = current_price
+            
+            await asyncio.sleep(5)
+            
+        # Пауза 30 минут между проверками
+        await asyncio.sleep(1800)
+
+# Фоновый микро-сервер для работы Render
 async def run_dummy_server():
     app = web.Application()
     app.router.add_get('/', lambda r: web.Response(text="Bot is running!"))
@@ -110,7 +164,9 @@ async def run_dummy_server():
 
 async def main():
     await run_dummy_server()
-    print("Бот успешно запущен!")
+    # Запуск авто-отслеживания цен:
+    asyncio.create_task(price_tracker_loop())
+    print("Бот запущен и следит за скидками!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
